@@ -11,6 +11,8 @@ NTU EE6008 项目 *QAP vs PTQ Bit-Width Crossover* 的 4 bit 代码。在 FEMBA-
 
 本仓库 = 作者的 [BioFoundation](https://github.com/pulp-bio/BioFoundation)(固定在提交 `f7e9437`,保留了原有提交历史,原 README 改名为 `README_BioFoundation.md`)+ 我们新增的文件,新增的文件都放在一个提交里:`git show --stat HEAD` 可以看到我们加了什么。**作者的文件一个都没改**:激活量化是在运行时替换模型实例的 `forward` 实现的。
 
+想直接上手:跳到[第 4 节](#4-怎么用),按 4.3 一步步跑一遍 W4 的 QAP。
+
 ## 1. 结果(单个随机种子 42)
 
 AUROC(验证集 / 测试集),浮点参照 0.8940 / 0.8721:
@@ -95,31 +97,130 @@ PTQ 的分位数在**验证集**上选定:8 bit 激活用 99.9%,4 bit 激活用 
 
 ## 4. 怎么用
 
-### 环境和数据
+### 4.1 QAP 的流程
 
-- 我们的环境:PyTorch 2.7.1 + cu126、`mamba_ssm` 2.2.6、`causal-conv1d`,其余依赖见作者的 `requirements.txt`。激活量化重写了 Mamba 的前向,按的是 `mamba_ssm` 2.2.6 的 `mamba_simple.py`,换版本要核对。
-- 我们的数据:按受试者划分的 TUAR,`train.h5`、`val.h5`、`test.h5`(167 / 19 / 23 个受试者)。预训练只用训练集的信号,验证集只看重建损失,测试集不参与预训练的任何环节。要换数据集,参考 `config/data_module/pretrain_tuar_subject.yaml`(预训练)和微调脚本里的 `data_module.*.hdf5_file=...` 参数改成自己的 h5 文件。
+QAP(quantization-aware pre-training)和普通做法的区别只有一点:**预训练阶段就带着量化**。整条流程分三步,每一步对应一个文件:
 
-### 安装
-
-```bash
-git clone <本仓库地址>
-cd BioFoundation        # 仓库根目录就是 BioFoundation 的根目录,脚本都在这里运行
+```
+① 预训练   在无标签信号上做"遮住一部分再重建",编码器权重带 4 bit 量化
+           tasks/pretrain_qap_task.py   →  输出 <输出目录>/final.ckpt
+                      │
+                      ▼
+② 微调     读入 final.ckpt 里的编码器(量化步长也一起读入),分类头随机初始化,
+           带 4 bit 量化训练分类任务
+           tasks/finetune_qap_task.py   →  输出 .../checkpoints/.../epoch=*.ckpt
+                      │
+                      ▼
+③ 评估     eval_femba.py                →  输出 <名字>_<val|test>_metrics.json
 ```
 
-`*.sbatch` 是我们集群上用的 Slurm 脚本,里面的数据路径、环境路径、输出路径和卡型号是示例,按你自己的环境改;不用 Slurm 的话,看脚本里最后那条 `python -u run_train.py ...` 命令,直接照着跑。
+要比较的几种做法,区别只在每一步的量化开关 `+qap_weight_bits`(0 = 浮点,4 = 权重 4 bit):
 
-### 先跑自检(CPU 即可)
+| 做法 | ① 预训练 | ② 微调 | ③ 评估 |
+|---|---|---|---|
+| **QAP** | `+qap_weight_bits=4` | `+qap_weight_bits=4`,读 QAP 的 `final.ckpt` | 直接评估 |
+| QAT | `+qap_weight_bits=0`(浮点) | `+qap_weight_bits=4`,读浮点预训练的 `final.ckpt` | 直接评估 |
+| 浮点参照 | 同上(浮点预训练) | `+qap_weight_bits=0` | 直接评估 |
+| PTQ | 不用另外训练 | 用浮点参照微调出来的 checkpoint | 加 `--ptq-bits 4` |
+| 不预训练 | 无 | `task=finetune_task pretrained_safetensors_path=null pretrained_checkpoint_path=null` | 直接评估 |
+
+微调的位宽必须和它读入的预训练一致(QAP 预训练用 4 bit,微调也得是 4 bit),不一致代码会报错。
+
+### 4.2 准备
+
+- **环境**:我们用 PyTorch 2.7.1 + cu126、`mamba_ssm` 2.2.6、`causal-conv1d`,其余依赖见作者的 `requirements.txt`。激活量化重写了 Mamba 的前向,对照的是 `mamba_ssm` 2.2.6 的 `mamba_simple.py`,换版本要核对。需要 GPU。
+- **代码**:`git clone <本仓库地址>`,然后 `cd` 进仓库根目录。下面所有命令都在根目录运行。
+- **数据**:HDF5 文件 `train.h5`、`val.h5`、`test.h5`,按受试者划分,训练集、验证集、测试集的受试者互不重叠。我们用的是 TUAR(167 / 19 / 23 个受试者),输入是 22 通道 × 1280 个采样点。预训练只读信号不读标签,验证集只用来看重建损失,测试集不参与预训练。
+- **两个环境变量**(作者的配置要求):
 
 ```bash
-python -m models.weight_quant     # 权重量化器:取值只落在允许的等级、梯度、存取一致
+export DATA_PATH=<放 h5 文件的目录>
+export CHECKPOINT_DIR=<这次运行的输出目录>      # 每次运行换一个目录,见下面的例子
+```
+
+### 4.3 跑一遍 W4 的 QAP(不用 Slurm)
+
+**先自检**(CPU 即可,几秒钟):
+
+```bash
+python -m models.weight_quant     # 权重量化器:取值只落在允许的等级、梯度正确、存取一致
 python -m models.act_quant        # 激活量化器:对称/非对称、截断、校准
-python check_final_save.py        # final.ckpt 的保存
 ```
 
-`models.weight_quant` 的自检最后会尝试和我们早期的 `models.qat_w8a32` 对比,本仓库没有那个文件,会打印"跳过",正常。
+`models.weight_quant` 最后会试着和我们早期的 `models.qat_w8a32` 对比,本仓库没有那个文件,会打印"跳过",正常。
 
-### 跑 4 bit 实验
+**① 预训练**(50 轮,在 L40 上约半小时):
+
+```bash
+export CHECKPOINT_DIR=$PWD/runs/pretrain_w4
+python -u run_train.py \
+  +experiment=FEMBA_pretrain task=pretrain_qap_task data_module=pretrain_tuar_subject \
+  data_module.train.hdf5_file=$DATA_PATH/train.h5 data_module.val.hdf5_file=$DATA_PATH/val.h5 \
+  tag=pretrain_w4 model.embed_dim=35 model.num_blocks=2 \
+  gpus=1 trainer.devices=1 trainer.strategy=auto batch_size=256 num_workers=0 \
+  trainer.max_epochs=50 \
+  +qap_weight_bits=4 +qap_act_bits=0 +qap_lr_schedule=cosine +qap_warmup_epochs=2 \
+  final_validate=False final_test=False io.base_output_path=$CHECKPOINT_DIR resume=False
+```
+
+跑完后 `runs/pretrain_w4/final.ckpt` 就是最后一轮的权重。屏幕上会打印 `[QAP] 编码器权重带 4 bit 量化预训练:21 个权重张量`,看到这行说明量化确实开了。
+
+**② 微调**(10 轮,在 L40 上约 20 分钟):
+
+```bash
+export CHECKPOINT_DIR=$PWD/runs/finetune_qap_w4
+python -u run_train.py \
+  +experiment=FEMBA_finetune task=finetune_qap_task \
+  pretrained_safetensors_path=null pretrained_checkpoint_path=$PWD/runs/pretrain_w4/final.ckpt \
+  +qap_weight_bits=4 +qap_act_bits=0 \
+  tag=finetune_qap_w4 model.embed_dim=35 model.num_classes=2 model.classification_type=bc \
+  data_module.train.hdf5_file=$DATA_PATH/train.h5 \
+  data_module.val.hdf5_file=$DATA_PATH/val.h5 \
+  data_module.test.hdf5_file=$DATA_PATH/test.h5 \
+  gpus=1 trainer.devices=1 trainer.strategy=auto batch_size=32 +trainer.accumulate_grad_batches=32 \
+  num_workers=0 trainer.max_epochs=10 \
+  final_validate=False final_test=False io.base_output_path=$CHECKPOINT_DIR resume=False
+```
+
+屏幕上会打印 `[QAP] 组别:QAP;权重位宽:4`。验证损失最低的那一轮存成 `runs/finetune_qap_w4/checkpoints/.../epoch=*.ckpt`,找它:
+
+```bash
+find runs/finetune_qap_w4/checkpoints -name "epoch=*.ckpt"
+```
+
+**③ 评估**(默认评估验证集;测试集要显式写 `--split test`):
+
+```bash
+python eval_femba.py --checkpoint <上一步找到的 epoch=*.ckpt> --name qap_w4 --out-dir runs/results
+python eval_femba.py --checkpoint <同一个 ckpt> --name qap_w4 --out-dir runs/results --split test
+```
+
+在 `runs/results/` 下得到 `qap_w4_val_metrics.json`(AUROC、AUPR、准确率、平衡准确率、F1、ECE、损失、按受试者重采样的 AUROC 95% 区间)、`..._predictions.npz`(每个窗口的原始输出)、`..._per_subject.csv`。约定:所有比较和选择都在验证集上做,测试集只给已经确定的配置各用一次。
+
+**对照组**:把上面的 `+qap_weight_bits` 按 4.1 的表改一改即可。PTQ 不用训练,对浮点参照的 checkpoint 直接量化再评估:
+
+```bash
+python eval_femba.py --checkpoint <浮点参照的 epoch=*.ckpt> --name ptq_w4 --out-dir runs/results --ptq-bits 4
+```
+
+**第一次跑,先试跑**:预训练命令末尾加 `+trainer.limit_train_batches=6 +trainer.limit_val_batches=2 trainer.log_every_n_steps=1`,微调命令末尾加 `+trainer.limit_train_batches=64 +trainer.limit_val_batches=2` 并把 `trainer.max_epochs` 改成 1,几分钟确认整条流程能跑通,再跑正式的。
+
+### 4.4 再加上激活量化(W4A8、W4A4)
+
+预训练和微调的命令都加(或改)这两个参数,两步要一致:
+
+| 目标 | 参数 |
+|---|---|
+| W4A8 | `+qap_weight_bits=4 +qap_act_bits=8 +qap_act_percentile=99.9` |
+| W4A4 | `+qap_weight_bits=4 +qap_act_bits=4 +qap_act_percentile=95` |
+
+`qap_act_percentile` 是校准激活范围时取的分位数。上面两个值是我们在自己数据的验证集上用 PTQ 选出来的(8 bit 激活 99.9,4 bit 激活 95),**换了数据集要重选**:拿一个微调好的浮点 checkpoint 跑 `python scan_act_quant.py --checkpoint <ckpt> --name ref --out-dir runs/results --quick`,看哪个分位数在验证集上最好。这个脚本还会检查重写的前向和原模型是否一致,以及哪一类位置对量化最敏感。
+
+激活量化时,预训练和微调开始前会自动校准:取训练集前几批数据,按前向顺序逐个位置定范围并打开量化器,之后范围随训练一起学习。
+
+### 4.5 用 Slurm 一键跑(我们集群上用的)
+
+`*.sbatch` 是上面几条命令的 Slurm 包装,里面的数据路径、环境路径、输出路径和卡型号是我们集群的示例,按你自己的环境改。
 
 ```bash
 sbatch chain_qap.sbatch 0           # 浮点预训练 → fp_ref、qat_w4、qat_w8 三个微调
@@ -138,18 +239,18 @@ sbatch finetune_tuar_qap.sbatch qap_w4 4 <预训练目录>/final.ckpt   # 参数
 sbatch finetune_tuar_qap.sbatch scratch 0 none                    # 不预训练的对照
 ```
 
-第一次用,先加 `smoke` 参数确认能跑通(每轮只跑几批),例如 `sbatch pretrain_tuar_qap.sbatch 4 4 cosine smoke`。
+`smoke` 参数就是上面的试跑。
 
-PTQ 评估(对浮点 checkpoint 直接量化,不训练):
+### 4.6 换成自己的数据集
 
-```bash
-python eval_femba.py --checkpoint <浮点微调ckpt> --name ptq_w4a4 --out-dir <结果目录> \
-    --ptq-bits 4 --ptq-act-bits 4 --ptq-act-percentile 95
-```
+1. 数据要整理成作者的 `HDF5Loader`(`datasets/hdf5_dataset.py`)能读的 HDF5 格式,制作方法见作者的 `make_datasets/` 和 `README_BioFoundation.md`。
+2. 命令里的 `data_module.*.hdf5_file=...` 指向你的文件。预训练用的 `config/data_module/pretrain_tuar_subject.yaml` 里写的是我们的文件路径,命令行覆盖即可,不用改文件。
+3. **输入形状**:我们是 22 通道 × 1280 点,预训练遮挡的小块是 2 通道 × 16 点。你的数据通道数或长度不同的话,要相应改 `model.*` 和遮挡设置,这部分我们没试过。
+4. 受试者划分要保证训练、验证、测试的受试者互不重叠,否则指标会偏高。
+5. 激活量化的分位数按 4.4 重新选。
+6. 量化代码本身不依赖数据,依赖的是 FEMBA 的模型结构(`patch_embed`、双向相加的 `mamba_blocks`、`classifier`)。
 
-测试集要显式写 `--split test`(默认只评估验证集)。约定:所有比较和选择都在验证集上做,测试集只给已经确定的配置各用一次。
-
-### 在自己的代码里用量化器
+### 4.7 在自己的代码里用量化器
 
 ```python
 from models.weight_quant import add_weight_quant, check_weight_quant
