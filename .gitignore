@@ -11,3 +11,10 @@ venv/
 outputs/
 checkpoints/
 wandb/
+
+# FEMBA-QAP additions
+*.log
+*.ckpt
+*.safetensors
+*.h5
+*.npz

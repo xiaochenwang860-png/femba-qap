@@ -1,0 +1,4 @@
+# @package _global_
+# 基线这条线上的 QAT：从作者的预训练权重出发带权重量化微调。用 +qap_weight_bits=0、8 或 4 选择。
+task:
+  _target_: 'tasks.finetune_base_qat_task.BaseQATFinetuneTask'

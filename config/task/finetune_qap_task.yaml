@@ -1,0 +1,4 @@
+# @package _global_
+# 从我们自己的预训练 checkpoint 出发微调。用 +qap_weight_bits=0（浮点）或 8 选择。
+task:
+  _target_: 'tasks.finetune_qap_task.QAPFinetuneTask'

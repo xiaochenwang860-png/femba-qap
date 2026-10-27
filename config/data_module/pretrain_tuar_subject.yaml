@@ -1,0 +1,20 @@
+# @package _global_
+# 预训练用的数据：按受试者划分的 TUAR，只读信号、不读标签（finetune: False）。
+#   train：训练集的 167 个受试者，用来预训练
+#   val：  验证集的 19 个受试者，只用来看重建损失、挑选预训练的 checkpoint
+# 测试集的受试者不参与预训练的任何环节。
+data_module:
+  _target_: data_module.finetune_data_module.FinetuneDataModule
+  name: "eeg"
+  cfg:
+    num_workers: ${num_workers}
+    batch_size: ${batch_size}
+  train:
+    _target_: 'datasets.hdf5_dataset.HDF5Loader'
+    hdf5_file: '/projects/fembaptq/TUAR_subject/train.h5'
+    finetune: False
+  val:
+    _target_: 'datasets.hdf5_dataset.HDF5Loader'
+    hdf5_file: '/projects/fembaptq/TUAR_subject/val.h5'
+    finetune: False
+  test: null
